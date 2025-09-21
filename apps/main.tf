@@ -213,8 +213,8 @@ data "terraform_remote_state" "infra" {
       container {
         name   = "users-api"
         image  = "${local.acr_name}/users-api:latest"
-        cpu    = 0.5
-        memory = "1.0Gi"
+        cpu    = 1.0 
+        memory = "2.0Gi" # ajuste para hacer el patron circuit breaker
         env {
           name  = "JWT_SECRET"
           value = "PRFT"
