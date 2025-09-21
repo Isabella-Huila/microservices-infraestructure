@@ -379,3 +379,37 @@ data "terraform_remote_state" "infra" {
       }
     }
   }
+
+
+    # Redis-prueba
+  resource "azurerm_container_app" "redis-prueba" {
+    name                         = "redis-prueba"
+    container_app_environment_id = local.cae_id
+    resource_group_name          = local.rg_name
+    revision_mode                = "Single"
+
+    template {
+            min_replicas = 0
+      
+      container {
+        name   = "redis-prueba"
+        image  = "redis:7.0-alpine"
+        cpu    = 0.25
+        memory = "0.5Gi"
+      }
+    }
+
+    ingress {
+      external_enabled = false
+      target_port      = 6379
+      transport        = "tcp"
+          traffic_weight {
+        percentage      = 100
+        latest_revision = true
+      }
+    }
+
+  }
+
+
+  # el patrón autoscaling ya esta implementado en cada contenedor con min_replicas y max_replicas, donde min_replicas es el numero minimo de instancias y max_replicas es el numero maximo de instancias que puede tener cada contenedor
