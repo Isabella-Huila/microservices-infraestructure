@@ -1,0 +1,230 @@
+name: Deploy Infra and Apps
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+# ===================================================================
+# CONFIGURACIÓN CENTRALIZADA
+# Todas las variables y secretos principales se gestionan aquí.
+# ===================================================================
+env:
+  # --- Configuración General del Repositorio ---
+  OWNER: ${{ github.repository_owner }}
+
+  # --- Repositorio de Desarrollo (Destino) ---
+  TARGET_REPO: microservices-example
+  TARGET_REPO_BRANCH: main # Rama del repo de apps a la que apuntará el trigger
+
+  # --- Secretos Centralizados ---
+  # Token con permisos para la API de GitHub y la gestión de secretos.
+  GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+  # Credenciales del Service Principal de Azure.
+  AZURE_CREDS: ${{ secrets.CREDS }}
+  # Clave de acceso para la cuenta de almacenamiento del backend de Terraform.
+  ARM_ACCESS_KEY: ${{ secrets.BUCKET_KEY }}
+
+  # --- Configuración del Backend de Terraform ---
+  TERRAFORM_BACKEND_STORAGE_ACCOUNT: mistorageisa
+  TERRAFORM_BACKEND_CONTAINER_NAME: tfstate
+  TERRAFORM_BACKEND_RESOURCE_GROUP: rg-terraform
+
+jobs:
+  # TRABAJO 1: Desplegar la infraestructura base
+  deploy-infra-base:
+    name: 'Deploy Infra Base'
+    runs-on: ubuntu-latest
+    environment: production 
+
+    defaults:
+      run:
+        working-directory: ./infra_base
+
+    outputs:
+      acr_login_server: ${{ steps.set_outputs.outputs.acr_login_server }}
+      acr_admin_username: ${{ steps.set_outputs.outputs.acr_admin_username }}
+      acr_admin_password: ${{ steps.set_outputs.outputs.acr_admin_password }}
+
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ env.AZURE_CREDS }}
+          auth-type: SERVICE_PRINCIPAL
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        id: init
+        # ARM_ACCESS_KEY se hereda del 'env' global
+        run: |
+          terraform init \
+            -backend-config="storage_account_name=${{ env.TERRAFORM_BACKEND_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ env.TERRAFORM_BACKEND_CONTAINER_NAME }}" \
+            -backend-config="resource_group_name=${{ env.TERRAFORM_BACKEND_RESOURCE_GROUP }}" \
+            -backend-config="key=infra.terraform.tfstate"
+
+      - name: Terraform Plan
+        id: plan
+        # ARM_ACCESS_KEY se hereda del 'env' global
+        run: terraform plan -no-color
+
+      - name: Terraform Apply
+        id: apply
+        # ARM_ACCESS_KEY se hereda del 'env' global
+        run: terraform apply -auto-approve -no-color
+
+      - name: Set Terraform Outputs
+        id: set_outputs
+        run: |
+          echo "acr_login_server=$(terraform output -raw acr_login_server)" >> $GITHUB_OUTPUT
+          echo "acr_admin_username=$(terraform output -raw acr_admin_username)" >> $GITHUB_OUTPUT
+          echo "acr_admin_password=$(terraform output -raw acr_admin_password)" >> $GITHUB_OUTPUT
+          echo "resource_group_name=$(terraform output -raw resource_group_name)" >> $GITHUB_OUTPUT
+
+      - name: Set Infrastructure Secrets in Target Repo
+        run: |
+          echo "Setting infrastructure secrets in repository: $OWNER/$TARGET_REPO"
+          
+          echo "${{ steps.set_outputs.outputs.acr_login_server }}" | gh secret set ACR_LOGIN_SERVER --repo $OWNER/$TARGET_REPO
+          echo "${{ steps.set_outputs.outputs.acr_admin_username }}" | gh secret set ACR_USERNAME --repo $OWNER/$TARGET_REPO
+          echo "${{ steps.set_outputs.outputs.acr_admin_password }}" | gh secret set ACR_PASSWORD --repo $OWNER/$TARGET_REPO
+          echo "${{ steps.set_outputs.outputs.resource_group_name }}" | gh secret set AZURE_RESOURCE_GROUP --repo $OWNER/$TARGET_REPO
+          
+          echo "Secrets have been successfully set in the target repository."
+  # TRABAJO 2: Verificar si las imágenes ya existen en ACR
+  check-images-in-acr:
+    name: 'Check for Existing Images in ACR'
+    needs: deploy-infra-base
+    runs-on: ubuntu-latest
+    environment: production
+
+    outputs:
+      skip_build: ${{ steps.check_images.outputs.skip_build }}
+      build_inputs: ${{ steps.check_images.outputs.build_inputs }}
+
+    steps:
+      - name: Log in to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ env.AZURE_CREDS }}
+          auth-type: SERVICE_PRINCIPAL
+
+      - name: Log in to ACR
+        run: az acr login --name ${{ needs.deploy-infra-base.outputs.acr_login_server }}
+
+      - name: Check which images are missing
+        id: check_images
+        run: |
+          # (El script de este paso no necesita cambios)
+          required_images=("auth-api" "frontend" "todos-api" "users-api" "log-message-processor")
+          missing_images=()
+          echo "Checking for required images in ACR: ${{ needs.deploy-infra-base.outputs.acr_login_server }}"
+          for image in "${required_images[@]}"; do
+            if ! az acr repository show --name ${{ needs.deploy-infra-base.outputs.acr_login_server }} --repository "$image" > /dev/null 2>&1; then
+              missing_images+=("$image")
+            fi
+          done
+          if [ ${#missing_images[@]} -eq 0 ]; then
+            echo "All required images exist. Skipping build."
+            echo "skip_build=true" >> $GITHUB_OUTPUT
+            echo "build_inputs={}" >> $GITHUB_OUTPUT
+          else
+            echo "Missing images: ${missing_images[*]}. Triggering build."
+            echo "skip_build=false" >> $GITHUB_OUTPUT
+            inputs_json="{\"build_all\": false"
+            for image in "${required_images[@]}"; do
+              if [[ " ${missing_images[*]} " =~ " ${image} " ]]; then
+                inputs_json+=", \"build_${image}\": true"
+              else
+                inputs_json+=", \"build_${image}\": false"
+              fi
+            done
+            inputs_json+="}"
+            echo "build_inputs=$inputs_json" >> $GITHUB_OUTPUT
+          fi
+          
+  # TRABAJO 3: Disparar el build de las aplicaciones
+  build-apps:
+    name: 'Build Missing App Artifacts'
+    needs: check-images-in-acr
+    if: needs.check-images-in-acr.outputs.skip_build == 'false'
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Set AUTO_DEPLOY secret to false in target repo
+        run: echo "false" | gh secret set AUTO_DEPLOY --repo $OWNER/$TARGET_REPO
+
+      - name: Trigger the build workflow in external repo
+        run: |
+          echo "Triggering 'Build and Push Microservices' on branch '${{ env.TARGET_REPO_BRANCH }}'..."
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github.v3+json" \
+            /repos/$OWNER/$TARGET_REPO/actions/workflows/build-and-push.yml/dispatches \
+            -f ref='${{ env.TARGET_REPO_BRANCH }}' \
+            --input - <<< '{"inputs": ${{ needs.check-images-in-acr.outputs.build_inputs }} }'
+          echo "Workflow triggered. Waiting..."
+          sleep 15
+
+      - name: Wait for workflow run to complete
+        env:
+          WORKFLOW_NAME: 'build-and-push.yml'
+        run: |
+          run_id=$(gh api repos/$OWNER/$TARGET_REPO/actions/workflows/$WORKFLOW_NAME/runs --jq '.workflow_runs[0].id')
+          if [ -z "$run_id" ]; then exit 1; fi
+          echo "Waiting for run ID: $run_id"
+          gh run watch $run_id --repo $OWNER/$TARGET_REPO --exit-status
+
+  # TRABAJO 4: Desplegar las aplicaciones
+  deploy-apps:
+    name: 'Deploy Apps'
+    needs: [check-images-in-acr, build-apps]
+    if: always() && needs.check-images-in-acr.result == 'success'
+    runs-on: ubuntu-latest
+    environment: production
+
+    defaults:
+      run:
+        working-directory: ./apps
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ env.AZURE_CREDS }}
+          auth-type: SERVICE_PRINCIPAL
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        id: init
+        run: |
+          terraform init \
+            -backend-config="storage_account_name=${{ env.TERRAFORM_BACKEND_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ env.TERRAFORM_BACKEND_CONTAINER_NAME }}" \
+            -backend-config="resource_group_name=${{ env.TERRAFORM_BACKEND_RESOURCE_GROUP }}" \
+            -backend-config="key=apps.terraform.tfstate"
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -no-color
+
+      - name: Terraform Apply
+        id: apply
+        run: terraform apply -auto-approve -no-color
+
+      - name: Set AUTO_DEPLOY secret to true in target repo
+        run: echo "true" | gh secret set AUTO_DEPLOY --repo $OWNER/$TARGET_REPO
